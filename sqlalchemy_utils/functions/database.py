@@ -1,11 +1,9 @@
 import itertools
 import os
 from collections.abc import Mapping, Sequence
-from copy import copy
 
 import sqlalchemy as sa
-from sqlalchemy.engine.url import make_url
-from sqlalchemy.exc import OperationalError, ProgrammingError
+from sqlalchemy.exc import DBAPIError, OperationalError, ProgrammingError
 
 from ..utils import starts_with
 from .orm import quote
@@ -420,121 +418,90 @@ def is_auto_assigned_date_column(column):
     )
 
 
-def database_exists(url):
+def sqlite_file_exists(database):
+    if not os.path.isfile(database) or os.path.getsize(database) < 100:
+        return False
+
+    with open(database, 'rb') as f:
+        header = f.read(100)
+
+    return header[:16] == b'SQLite format 3\x00'
+
+
+def database_exists(engine, db_name):
     """Check if a database exists.
 
-    :param url: A SQLAlchemy engine URL.
+    :param engine: A SQLAlchemy Engine object
+    :param db_name: Database name
 
     Performs backend-specific testing to quickly determine if a database
     exists on the server. ::
 
-        database_exists('postgresql://postgres@localhost/name')  #=> False
-        create_database('postgresql://postgres@localhost/name')
-        database_exists('postgresql://postgres@localhost/name')  #=> True
-
-    Supports checking against a constructed URL as well. ::
-
-        engine = create_engine('postgresql://postgres@localhost/name')
-        database_exists(engine.url)  #=> False
-        create_database(engine.url)
-        database_exists(engine.url)  #=> True
-
+        database_exists(engine, 'db_name')  #=> False
+        create_database(engine, 'db_name')
+        database_exists(engine, 'db_name')  #=> True
     """
 
     def get_scalar_result(engine, sql):
         result_proxy = engine.execute(sql)
         result = result_proxy.scalar()
         result_proxy.close()
-        engine.dispose()
         return result
 
-    def sqlite_file_exists(database):
-        if not os.path.isfile(database) or os.path.getsize(database) < 100:
-            return False
-
-        with open(database, 'rb') as f:
-            header = f.read(100)
-
-        return header[:16] == b'SQLite format 3\x00'
-
-    url = copy(make_url(url))
-    database, url.database = url.database, None
-    engine = sa.create_engine(url)
-
     if engine.dialect.name == 'postgresql':
-        text = "SELECT 1 FROM pg_database WHERE datname='%s'" % database
+        text = "SELECT 1 FROM pg_database WHERE datname = '%s'" % db_name
         return bool(get_scalar_result(engine, text))
 
     elif engine.dialect.name == 'mysql':
         text = ("SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA "
-                "WHERE SCHEMA_NAME = '%s'" % database)
+                "WHERE SCHEMA_NAME = '%s'" % db_name)
         return bool(get_scalar_result(engine, text))
 
     elif engine.dialect.name == 'sqlite':
-        if database:
-            return database == ':memory:' or sqlite_file_exists(database)
+        if db_name:
+            return db_name == ':memory:' or sqlite_file_exists(db_name)
         else:
             # The default SQLAlchemy database is in memory,
             # and :memory is not required, thus we should support that use-case
             return True
 
     else:
-        engine.dispose()
-        engine = None
         text = 'SELECT 1'
+        new_engine = None
         try:
-            url.database = database
-            engine = sa.create_engine(url)
-            result = engine.execute(text)
+            url = engine.url
+            url.database = db_name
+            new_engine = sa.create_engine(url)
+            result = new_engine.execute(text)
             result.close()
             return True
-
-        except (ProgrammingError, OperationalError):
+        except (DBAPIError, ProgrammingError, OperationalError):
             return False
         finally:
-            if engine is not None:
-                engine.dispose()
+            if new_engine is not None:
+                new_engine.dispose()
 
 
-def create_database(url, encoding='utf8', template=None):
+def create_database(engine, db_name, encoding='utf8', template=None):
     """Issue the appropriate CREATE DATABASE statement.
 
-    :param url: A SQLAlchemy engine URL.
+    :param engine: A SQLAlchemy Engine object
+    :param db_name: Database name
     :param encoding: The encoding to create the database as.
     :param template:
         The name of the template from which to create the new database. At the
         moment only supported by PostgreSQL driver.
 
-    To create a database, you can pass a simple URL that would have
-    been passed to ``create_engine``. ::
+    To create a database, you just pass a Connection object with the desired
+    database name.
+    ::
 
-        create_database('postgresql://postgres@localhost/name')
+        create_database(conn, 'db_name')
 
-    You may also pass the url from an existing engine. ::
-
-        create_database(engine.url)
 
     Has full support for mysql, postgres, and sqlite. In theory,
     other database engines should be supported.
     """
-
-    url = copy(make_url(url))
-
-    database = url.database
-
-    if url.drivername.startswith('postgres'):
-        url.database = 'postgres'
-    elif url.drivername.startswith('mssql'):
-        url.database = 'master'
-    elif not url.drivername.startswith('sqlite'):
-        url.database = None
-
-    if url.drivername == 'mssql+pyodbc':
-        engine = sa.create_engine(url, connect_args={'autocommit': True})
-    elif url.drivername == 'postgresql+pg8000':
-        engine = sa.create_engine(url, isolation_level='AUTOCOMMIT')
-    else:
-        engine = sa.create_engine(url)
     result_proxy = None
 
     if engine.dialect.name == 'postgresql':
@@ -542,7 +509,7 @@ def create_database(url, encoding='utf8', template=None):
             template = 'template1'
 
         text = "CREATE DATABASE {0} ENCODING '{1}' TEMPLATE {2}".format(
-            quote(engine, database),
+            quote(engine, db_name),
             encoding,
             quote(engine, template)
         )
@@ -562,60 +529,40 @@ def create_database(url, encoding='utf8', template=None):
 
     elif engine.dialect.name == 'mysql':
         text = "CREATE DATABASE {0} CHARACTER SET = '{1}'".format(
-            quote(engine, database),
+            quote(engine, db_name),
             encoding
         )
         result_proxy = engine.execute(text)
 
-    elif engine.dialect.name == 'sqlite' and database != ':memory:':
-        if database:
-            engine.execute("CREATE TABLE DB(id int);")
-            engine.execute("DROP TABLE DB;")
+    elif engine.dialect.name == 'sqlite' and db_name != ':memory:':
+        if db_name:
+            engine.execute('CREATE TABLE DB(id int)')
+            engine.execute('DROP TABLE DB')
 
     else:
-        text = 'CREATE DATABASE {0}'.format(quote(engine, database))
+        text = 'CREATE DATABASE {0}'.format(quote(engine, db_name))
         result_proxy = engine.execute(text)
 
     if result_proxy is not None:
         result_proxy.close()
-    engine.dispose()
 
 
-def drop_database(url):
+def drop_database(engine, db_name):
     """Issue the appropriate DROP DATABASE statement.
 
-    :param url: A SQLAlchemy engine URL.
+    :param engine: A SQLAlchemy Engine object
+    :param db_name: Database name
 
-    Works similar to the :ref:`create_database` method in that both url text
-    and a constructed url are accepted. ::
+    Works similar to the :ref:`create_database` function::
 
-        drop_database('postgresql://postgres@localhost/name')
-        drop_database(engine.url)
+        drop_database(engine, 'db_name')
 
     """
-
-    url = copy(make_url(url))
-
-    database = url.database
-
-    if url.drivername.startswith('postgres'):
-        url.database = 'postgres'
-    elif url.drivername.startswith('mssql'):
-        url.database = 'master'
-    elif not url.drivername.startswith('sqlite'):
-        url.database = None
-
-    if url.drivername == 'mssql+pyodbc':
-        engine = sa.create_engine(url, connect_args={'autocommit': True})
-    elif url.drivername == 'postgresql+pg8000':
-        engine = sa.create_engine(url, isolation_level='AUTOCOMMIT')
-    else:
-        engine = sa.create_engine(url)
     conn_resource = None
 
-    if engine.dialect.name == 'sqlite' and database != ':memory:':
-        if database:
-            os.remove(database)
+    if engine.dialect.name == 'sqlite' and db_name != ':memory:':
+        if db_name:
+            os.remove(db_name)
 
     elif (
                 engine.dialect.name == 'postgresql' and
@@ -641,17 +588,16 @@ def drop_database(url):
         FROM pg_stat_activity
         WHERE pg_stat_activity.datname = '%(database)s'
           AND %(pid_column)s <> pg_backend_pid();
-        ''' % {'pid_column': pid_column, 'database': database}
+        ''' % {'pid_column': pid_column, 'database': db_name}
         connection.execute(text)
 
         # Drop the database.
-        text = 'DROP DATABASE {0}'.format(quote(connection, database))
+        text = 'DROP DATABASE {0}'.format(quote(connection, db_name))
         connection.execute(text)
         conn_resource = connection
     else:
-        text = 'DROP DATABASE {0}'.format(quote(engine, database))
+        text = 'DROP DATABASE {0}'.format(quote(engine, db_name))
         conn_resource = engine.execute(text)
 
     if conn_resource is not None:
         conn_resource.close()
-    engine.dispose()

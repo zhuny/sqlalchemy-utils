@@ -98,8 +98,12 @@ def mssql_db_driver():
 
 @pytest.fixture
 def mssql_dsn(mssql_db_user, mssql_db_password, mssql_db_driver, db_name):
-    return 'mssql+pyodbc://{0}:{1}@localhost/{2}?driver={3}'\
-        .format(mssql_db_user, mssql_db_password, db_name, mssql_db_driver)
+    return 'mssql+pyodbc://{0}:{1}@localhost/{2}?driver={3}'.format(
+        mssql_db_user,
+        mssql_db_password,
+        db_name,
+        mssql_db_driver
+    )
 
 
 @pytest.fixture
